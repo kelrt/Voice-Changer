@@ -5,6 +5,14 @@ A voice converter that records a clip from your microphone and re-speaks it in a
 - The **C++ client** handles audio I/O, RNNoise denoising, band-limited resampling and sample-count correction.
 - A **Python server** runs the neural networks: ContentVec, torchcrepe and an RVC v2 synthesizer.
 
+## Demo
+**Input**
+asdfasdfasdf
+
+**Output**
+asdfasdfadsf
+
+
 ## Setup
 
 **Server** (Python 3.10):
