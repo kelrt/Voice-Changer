@@ -47,8 +47,8 @@ constexpr float kMaxRecordSeconds = 25.0f; // A clip must fit in the 30 s output
 constexpr float kMaxPitchSemitones = 24.0f;
 const char* const kSaveDir = "saved_outputs";
 
-struct AppConfig {
-    float pitch_shift_semitones = 12.0f; // +12 = one octave up.
+struct AppConfig { // im so cooked
+    float pitch_shift_semitones = 11.0f; // +12 = one octave up.
     float recording_duration = 5.0f;
 } g_config;
 
