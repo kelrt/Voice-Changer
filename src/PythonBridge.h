@@ -1,63 +1,49 @@
 // /src/PythonBridge.h
 
-// --- HEADER GUARDS ---
-// These lines prevent this file from being pasted into your program twice.
-// If you include "PythonBridge.h" in both main.cpp and another file,
-// the compiler would error out saying "PythonBridge is defined twice" without this.
 #ifndef VOICE_CHANGER_PYTHONBRIDGE_H
 #define VOICE_CHANGER_PYTHONBRIDGE_H
 
-#include <vector>        // Needed for std::vector (the list of audio samples).
-#include <netinet/in.h>  // Needed for "struct sockaddr_in" (Linux networking structures).
+#include <cstddef>
+#include <string>
+#include <vector>
 
-// This class handles the TCP Client.
-// It acts as a "Bridge" connecting our fast C++ audio engine
-// to the smart (but slower) Python AI backend.
+// Audio returned by the server, at whatever rate the voice model produces.
+struct ConvertedAudio {
+    std::vector<float> samples;
+    int sample_rate = 0;
+};
+
+// TCP client for the Python inference server (src/server/server.py).
+//
+// Wire format (native byte order, both ends run on the same machine):
+//   request:  int32 sample_count, int32 pitch_semitones, float32[sample_count]                mono, 16 kHz
+//   response: int32 sample_count, int32 sample_rate, float32[sample_count]                    mono, model rate
+// The client does all resampling: it sends 16 kHz (the rate the models analyze at) and converts
+// the reply from the model's rate back to 48 kHz. A response count of 0 means the server failed.
 class PythonBridge {
-
-// --- PRIVATE MEMBERS ---
-// These variables are hidden. 'main.cpp' cannot see or touch them.
-// This is "Encapsulation". We don't want the main loop accidentally
-// messing with the raw socket ID.
-private:
-   // In Linux/Unix, a Socket is just a file.
-   // This integer is the "File Descriptor" (ID) of that open connection.
-   // We initialize it to -1 because 0 is a valid ID (stdin). -1 means "Disconnected".
-   int sock = -1;
-
-   // This is a C-style structure defined in <netinet/in.h>.
-   // It holds the IP Address (127.0.0.1) and the Port (51235).
-   // We store it here so we don't have to rebuild it every time we reconnect.
-   struct sockaddr_in serv_addr;
-
-   // A simple flag to track state.
-   // We check this before trying to send data so we don't crash
-   // by writing to a closed socket.
-   bool connected = false;
-
-// --- PUBLIC INTERFACE ---
-// These are the buttons main.cpp is allowed to push.
 public:
-   // Constructor: Sets up the empty object.
-   PythonBridge();
+    explicit PythonBridge(std::string host = "127.0.0.1", int port = 51235);
+    ~PythonBridge();
 
-   // Destructor: Automatically calls Disconnect() when the program closes.
-   // Ensures we don't leave "zombie" connections open in the OS.
-   ~PythonBridge();
+    // Owns a socket, so copying would double-close it.
+    PythonBridge(const PythonBridge&) = delete;
+    PythonBridge& operator=(const PythonBridge&) = delete;
 
-   // Tries to dial the Python server.
-   // Returns 'true' if the handshake succeeded, 'false' if Python is offline.
-   bool Connect();
+    // Returns false if the server is not reachable yet. Safe to call repeatedly.
+    bool Connect();
+    void Disconnect();
 
-   // Hangs up the phone and frees the system resources.
-   void Disconnect();
+    // Sends one clip and blocks until the converted clip comes back.
+    // Reconnects once if the connection was lost earlier. Returns empty samples on any failure.
+    ConvertedAudio ProcessAudio(const std::vector<float>& input16k, int pitch_semitones);
 
-   // The core function:
-   // 1. Takes raw audio (input).
-   // 2. Sends it to Python.
-   // 3. Waits for Python to think.
-   // 4. Returns the modified audio.
-   std::vector<float> ProcessAudio(const std::vector<float>& input, int pitch);
+private:
+    bool SendAll(const void* data, size_t len);
+    bool RecvAll(void* data, size_t len);
+
+    std::string host;
+    int port;
+    int sock = -1; // -1 means disconnected.
 };
 
 #endif

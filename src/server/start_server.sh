@@ -1,4 +1,5 @@
 #!/bin/bash
-   cd ~/code/voice-changer
-   source venv/bin/activate
-   python /home/relz/code/voice-changer/src/server/server.py
+# Run from anywhere: resolve the repo root relative to this script.
+cd "$(dirname "$0")/../.." || exit 1
+source .venv/bin/activate
+python src/server/server.py

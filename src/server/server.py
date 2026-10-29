@@ -1,77 +1,136 @@
 # server.py
+#
+# Inference server for the C++ client (see ARCHITECTURE.md). Receives 16 kHz mono clips over TCP
+# and returns them converted to the target voice, at the voice model's own sample rate. All
+# resampling to and from 48 kHz happens in the client.
+#
+#   python src/server/server.py                                        serve the C++ client
+#   python src/server/server.py --selftest in.wav out.wav [--pitch 12]  convert a file, no client
+#
+# Pipeline (RVC v2):
+#   ContentVec (ONNX)  16 kHz audio -> 768-dim "what is being said" features, 50 frames/s
+#   torchcrepe         16 kHz audio -> pitch track, 100 frames/s, shifted by N semitones
+#   Synthesizer (PyTorch, Applio's RVC v2 code) features + pitch -> audio in the target voice
+import argparse
+import configparser
 import socket
 import struct
+import sys
+import time
+import traceback
+import wave
+from pathlib import Path
+
 import numpy as np
 import onnxruntime as ort
 import torch
-import torchaudio
-import sys
-import traceback
-import time
-import faiss
+import torch.nn.functional as F
 import torchcrepe
-import configparser
 
-# ---------------- COLORS ----------------
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(Path(__file__).resolve().parent / 'vendor'))
+from rvc.lib.algorithm.synthesizers import Synthesizer  # noqa: E402  (needs the vendor path above)
+
+INPUT_SR = 16000          # The rate the client sends and both analysis models expect.
+HOP = 160                 # 10 ms at 16 kHz: one pitch frame, and one synthesizer frame after upsampling features.
+F0_MIN, F0_MAX = 50, 1100 # Range of the coarse pitch embedding the voice model was trained with.
+VOICED_THRESHOLD = 0.21   # torchcrepe periodicity below this is treated as unvoiced (breath, consonants, silence).
+# Measured on a 5 s clip (CPU): 'tiny' takes 1.4 s vs 15.9 s for 'full', agrees on 98% of
+# voiced/unvoiced decisions, and differs by a median 12 cents (1/8 semitone). Not worth 11x the time.
+CREPE_MODEL = 'tiny'
+
 GREEN = "\033[32m"
 RESET = "\033[0m"
 
-def green_print(msg):
-    print(f"{GREEN}{msg}{RESET}")
 
-# ---------------- CONFIG LOADING ----------------
-config = configparser.ConfigParser()
-config.read('config.ini')
+def log(msg):
+    print(f"{GREEN}{msg}{RESET}", flush=True)
 
-HOST = config['NETWORK'].get('HOST', '127.0.0.1')
-PORT = config['NETWORK'].getint('PORT', 51235)
-MODEL_PATH = config['PATHS'].get('MODEL_PATH', 'models/voice.onnx')
-HUBERT_PATH = config['PATHS'].get('HUBERT_PATH', 'models/hubert.onnx')
-INDEX_PATH = config['PATHS'].get('INDEX_PATH', 'models/voice.index')
-INDEX_RATE = config['MODEL_TUNING'].getfloat('INDEX_RATE', 0.75)
-MODEL_SAMPLE_RATE = config['MODEL_TUNING'].getint('MODEL_SAMPLE_RATE', 40000)
 
-TARGET_SAMPLE_RATE = 48000
-INPUT_SR = 48000
+# ---------------- MODELS ----------------
+class VoiceConverter:
+    def __init__(self, contentvec_path, model_path):
+        for path in (contentvec_path, model_path):
+            if not path.is_file():
+                raise SystemExit(f"[Server] Missing model file {path}. Run scripts/fetch_models.sh "
+                                 f"and put your RVC checkpoint at models/voice.pth.")
 
-# ---------------- PRINT SELECTED STATUS ----------------
-green_print(f"[Server] Model sample rate: {MODEL_SAMPLE_RATE} Hz")
-green_print(f"[Server] Index rate: {INDEX_RATE}")
+        opts = ort.SessionOptions()
+        opts.log_severity_level = 3
+        self.contentvec = ort.InferenceSession(str(contentvec_path), opts)
+        log(f"[Server] ContentVec loaded from {contentvec_path}")
 
-# ---------------- LOAD FAISS INDEX ----------------
-index = None
-try:
-    index = faiss.read_index(INDEX_PATH)
-    if hasattr(index, 'make_direct_map'):
-        index.make_direct_map()
-except Exception:
-    index = None  # silently fail
+        ckpt = torch.load(model_path, map_location='cpu', weights_only=True)
+        if ckpt.get('version') != 'v2' or not ckpt.get('f0'):
+            raise SystemExit(f"[Server] {model_path} is not an RVC v2 model with pitch guidance")
+        self.sample_rate = int(ckpt['sr'])
+        self.net = Synthesizer(*ckpt['config'], use_f0=True, text_enc_hidden_dim=768,
+                               vocoder=ckpt.get('vocoder', 'HiFi-GAN'))
+        # enc_q (the posterior encoder) is only used in training and is stripped from inference
+        # checkpoints. Everything else must load exactly: a silent partial load produces noise.
+        del self.net.enc_q
+        self.net.load_state_dict(ckpt['weight'], strict=True)
+        self.net.eval()
+        log(f"[Server] Voice model loaded from {model_path}: "
+            f"'{ckpt.get('model_name', '?')}', RVC v2, {self.sample_rate} Hz")
 
-# ---------------- LOAD AI MODELS ----------------
-opts = ort.SessionOptions()
-opts.intra_op_num_threads = 4
-opts.log_severity_level = 3
+    def features(self, audio_16k):
+        embed = self.contentvec.run(['embed'], {'source': audio_16k[np.newaxis, np.newaxis, :]})[0]
+        feats = torch.from_numpy(embed)  # [1, T, 768] at 50 frames/s
+        # The synthesizer works at 100 frames/s (one frame per 10 ms hop), so every feature frame
+        # is repeated. Skipping this halves the output length, which is the bug that made earlier
+        # versions of this project sound sped up.
+        return F.interpolate(feats.transpose(1, 2), scale_factor=2).transpose(1, 2)
 
-hubert_sess = ort.InferenceSession(HUBERT_PATH, opts)
-green_print(f"[Server] HuBERT loaded from: {HUBERT_PATH}")
+    @staticmethod
+    def pitch(audio_16k, semitones):
+        f0, periodicity = torchcrepe.predict(
+            torch.from_numpy(audio_16k).unsqueeze(0), INPUT_SR, hop_length=HOP,
+            fmin=F0_MIN, fmax=F0_MAX, model=CREPE_MODEL, batch_size=512, device='cpu',
+            decoder=torchcrepe.decode.viterbi, return_periodicity=True)
+        periodicity = torchcrepe.filter.median(periodicity, 3)
+        f0 = torchcrepe.threshold.At(VOICED_THRESHOLD)(f0, periodicity)  # Unvoiced frames become NaN.
+        f0 = torch.nan_to_num(f0, nan=0.0).squeeze(0).numpy()
+        return f0 * 2 ** (semitones / 12.0)
 
-voice_sess  = ort.InferenceSession(MODEL_PATH, opts)
-green_print(f"[Server] Voice model loaded from: {MODEL_PATH}")
+    @staticmethod
+    def coarse_pitch(f0):
+        # Quantize Hz onto the 1..255 mel-spaced bins of the model's pitch embedding (RVC's formula).
+        # Unvoiced frames (f0 = 0) land in bin 1.
+        mel = 1127 * np.log(1 + f0 / 700)
+        mel_min, mel_max = 1127 * np.log(1 + F0_MIN / 700), 1127 * np.log(1 + F0_MAX / 700)
+        voiced = mel > 0
+        mel[voiced] = (mel[voiced] - mel_min) * 254 / (mel_max - mel_min) + 1
+        return np.rint(np.clip(mel, 1, 255)).astype(np.int64)
 
-# ---------------- RESAMPLERS ----------------
-analysis_resampler = torchaudio.transforms.Resample(INPUT_SR, 16000)
-output_resampler = torchaudio.transforms.Resample(MODEL_SAMPLE_RATE, TARGET_SAMPLE_RATE)
+    def convert(self, audio_16k, semitones):
+        timings = {}
+        t = time.time()
+        feats = self.features(audio_16k)
+        timings['contentvec'] = time.time() - t
 
-# ---------------- UTILS ----------------
-def f0_to_coarse(f0):
-    f0_mel = 1127 * np.log(1 + f0 / 700)
-    f0_mel_min = 1127 * np.log(1 + 50 / 700)
-    f0_mel_max = 1127 * np.log(1 + 1100 / 700)
-    f0_coarse = (f0_mel - f0_mel_min) * 254 / (f0_mel_max - f0_mel_min) + 1
-    f0_coarse[f0_mel <= f0_mel_min] = 1
-    f0_coarse[f0_mel >= f0_mel_max] = 255
-    return np.clip(np.round(f0_coarse), 1, 255).astype(np.int64)
+        t = time.time()
+        f0 = self.pitch(audio_16k, semitones)
+        timings['crepe'] = time.time() - t
 
+        frames = min(len(audio_16k) // HOP, feats.shape[1], len(f0))
+        feats, f0 = feats[:, :frames], f0[:frames]
+
+        t = time.time()
+        with torch.no_grad():
+            audio = self.net.infer(
+                feats, torch.tensor([frames]),
+                torch.from_numpy(self.coarse_pitch(f0.copy())).unsqueeze(0),
+                torch.from_numpy(f0.astype(np.float32)).unsqueeze(0),
+                torch.tensor([0]))[0]
+        timings['synth'] = time.time() - t
+
+        voiced = np.count_nonzero(f0) / max(frames, 1)
+        log("[Server] " + ", ".join(f"{k} {v:.2f}s" for k, v in timings.items()) + f", {voiced:.0%} voiced")
+        return np.clip(audio.squeeze().numpy(), -1.0, 1.0).astype(np.float32)
+
+
+# ---------------- NETWORK ----------------
 def recvall(sock, n):
     data = b''
     while len(data) < n:
@@ -81,129 +140,79 @@ def recvall(sock, n):
         data += chunk
     return data
 
-# ---------------- AUDIO PROCESSING ----------------
-def process_audio(data, pitch_shift):
+
+def serve(converter, host, port):
+    log(f"[Server] Server ready. Listening on {host}:{port}")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind((host, port))
+        server.listen()
+        while True:
+            conn, addr = server.accept()
+            log(f"[Server] Client connected: {addr}")
+            with conn:
+                while (header := recvall(conn, 8)) is not None:
+                    count, pitch = struct.unpack('ii', header)
+                    payload = recvall(conn, count * 4)
+                    if payload is None:
+                        break
+                    audio = np.frombuffer(payload, dtype=np.float32).copy()  # frombuffer is read-only; torch needs writable.
+                    log(f"[Server] Received {count / INPUT_SR:.2f}s of audio, pitch {pitch:+d}")
+                    try:
+                        out = converter.convert(audio, pitch)
+                        conn.sendall(struct.pack('ii', len(out), converter.sample_rate) + out.tobytes())
+                    except Exception:
+                        print("[Server] Conversion failed, replying with 0 samples:")
+                        traceback.print_exc()
+                        conn.sendall(struct.pack('ii', 0, 0))
+            log("[Server] Client disconnected")
+
+
+# ---------------- SELF-TEST ----------------
+def read_wav_16k(path):
+    import soxr
+    with wave.open(str(path)) as w:
+        if w.getsampwidth() != 2:
+            raise SystemExit("[Server] --selftest expects a 16-bit PCM WAV")
+        audio = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768
+        audio = audio.reshape(-1, w.getnchannels()).mean(axis=1)
+        return soxr.resample(audio, w.getframerate(), INPUT_SR).astype(np.float32)
+
+
+def write_wav(path, audio, sample_rate):
+    with wave.open(str(path), 'wb') as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sample_rate)
+        w.writeframes((audio * 32767).astype(np.int16).tobytes())
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--selftest', nargs=2, metavar=('IN_WAV', 'OUT_WAV'),
+                        help='convert a WAV file and exit, without the C++ client')
+    parser.add_argument('--pitch', type=int, default=12, help='semitones for --selftest (default +12)')
+    args = parser.parse_args()
+
+    config = configparser.ConfigParser()
+    if not config.read(REPO_ROOT / 'config.ini'):
+        raise SystemExit(f"[Server] Config not found: {REPO_ROOT / 'config.ini'}")
+    converter = VoiceConverter(REPO_ROOT / config['PATHS']['CONTENTVEC_PATH'],
+                               REPO_ROOT / config['PATHS']['MODEL_PATH'])
+
+    if args.selftest:
+        audio = read_wav_16k(args.selftest[0])
+        out = converter.convert(audio, args.pitch)
+        write_wav(args.selftest[1], out, converter.sample_rate)
+        log(f"[Server] {len(audio) / INPUT_SR:.2f}s in -> {len(out) / converter.sample_rate:.2f}s out, "
+            f"written to {args.selftest[1]}")
+        return
+
     try:
-        audio_raw = np.frombuffer(data, dtype=np.float32).copy()
-        green_print(f"[Server] Received audio: {len(audio_raw)} samples")
-        if len(audio_raw) < 1600:
-            return b''
-
-        audio_tensor = torch.from_numpy(audio_raw)
-        audio_16k_tensor = analysis_resampler(audio_tensor)
-        audio_16k = audio_16k_tensor.numpy()
-
-        # HuBERT embedding
-        inp = audio_16k[np.newaxis, np.newaxis, :].astype(np.float32)
-        embed = hubert_sess.run(["embed"], {"source": inp})[0]
-        if embed.ndim == 3 and embed.shape[1] == 768:
-            embed = np.transpose(embed, (0, 2, 1))
-
-        # INDEX MIXING
-        if index is not None and INDEX_RATE > 0:
-            try:
-                query = embed.squeeze(0).astype(np.float32)
-                D, I = index.search(query, 1)
-                retrieved = index.reconstruct_batch(I.flatten().astype(np.int64))
-                embed_mixed = (query * (1 - INDEX_RATE)) + (retrieved * INDEX_RATE)
-                embed = embed_mixed[np.newaxis, :, :]
-            except Exception:
-                pass
-
-        T = embed.shape[1]
-
-        # Pitch detection (CREPE)
-        try:
-            f0 = torchcrepe.predict(
-                audio_16k_tensor.unsqueeze(0),
-                16000,
-                hop_length=160,
-                fmin=50,
-                fmax=1000,
-                model='tiny',
-                batch_size=256,
-                device='cpu',
-                decoder=torchcrepe.decode.viterbi
-            ).squeeze(0).numpy()
-            if len(f0) != T:
-                f0 = np.interp(np.linspace(0, len(f0), T), np.arange(len(f0)), f0).astype(np.float32)
-        except Exception:
-            f0 = np.zeros(T, dtype=np.float32)
-
-        factor = 2 ** (pitch_shift / 12.0)
-        voiced = f0 > 0
-        f0[voiced] *= factor
-        pitch_coarse = f0_to_coarse(f0)
-        pitch_coarse[~voiced] = 0
-
-        inputs = {
-            "feats": embed,
-            "p_len": np.array([T], dtype=np.int64),
-            "pitch": pitch_coarse[None, :],
-            "pitchf": f0[None, :],
-            "sid": np.array([0], dtype=np.int64)
-        }
-
-        out = voice_sess.run(["audio"], inputs)[0].squeeze().astype(np.float32)
-        if out.ndim > 1:
-            out = out.reshape(-1)
-
-        out_tensor = torch.from_numpy(out)
-        out_tensor = output_resampler(out_tensor)
-        out = out_tensor.numpy()
-
-        return out.astype(np.float32).tobytes()
-
-    except Exception:
-        return b''
-
-# ---------------- MAIN SERVER LOOP ----------------
-green_print(f"[Server] Server ready. Listening on {HOST}:{PORT}")
-
-while True:
-    server_socket = None
-    try:
-        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_socket.bind((HOST, PORT))
-        server_socket.listen()
-
-        conn, addr = server_socket.accept()
-        green_print(f"[Server] Client connected: {addr}")
-
-        with conn:
-            while True:
-                header = recvall(conn, 8)
-                if not header:
-                    green_print("[Server] Client disconnected")
-                    break
-
-                size, pitch = struct.unpack('ii', header)
-                data = recvall(conn, size * 4)
-                if not data:
-                    green_print("[Server] Client disconnected")
-                    break
-
-                try:
-                    result = process_audio(data, pitch)
-                    if len(result) > 0:
-                        conn.sendall(struct.pack('i', len(result)//4))
-                        conn.sendall(result)
-                    else:
-                        conn.sendall(struct.pack('i', 0))
-                except Exception:
-                    conn.sendall(struct.pack('i', 0))
-
+        serve(converter, config['NETWORK'].get('HOST', '127.0.0.1'), config['NETWORK'].getint('PORT', 51235))
     except KeyboardInterrupt:
-        break
+        log("[Server] Server terminated")
 
-    except Exception:
-        time.sleep(1)
 
-    finally:
-        if server_socket:
-            server_socket.close()
-            server_socket = None
-            green_print("[Server] Socket closed")
-
-green_print("[Server] Server terminated")
+if __name__ == '__main__':
+    main()

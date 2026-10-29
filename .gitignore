@@ -1,14 +1,16 @@
-# Ignore everything in the models folder
+# Model files are too large for git; only the README is tracked.
 models/*
-
-# ...But do not ignore the README.md
 !models/README.md
 
-# files are too big
+# Python
+.venv/
 venv/
+__pycache__/
+*.pth
 
-/home/relz/code/voice-changer/vcpkg
+# Build output and IDE files
+build/
+.idea/
 
-# dont want my sussy recording on github lol
-saved_outputs/*
-#add some sample files someday
+# Recordings saved by the client
+saved_outputs/

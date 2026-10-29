@@ -5,10 +5,14 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(Threads REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(RNNOISE REQUIRED IMPORTED_TARGET rnnoise) # Fedora: dnf install rnnoise-devel
 
 add_executable(voice_changer_app
         src/main.cpp
+        src/Denoiser.cpp
         src/PythonBridge.cpp
+        src/Resampler.cpp
 )
 
 target_include_directories(voice_changer_app PRIVATE
@@ -18,4 +22,4 @@ target_include_directories(voice_changer_app PRIVATE
 )
 
 # miniaudio loads ALSA/PulseAudio at runtime: needs libdl + pthreads, not audio dev packages
-target_link_libraries(voice_changer_app PRIVATE Threads::Threads ${CMAKE_DL_LIBS} m)
+target_link_libraries(voice_changer_app PRIVATE Threads::Threads PkgConfig::RNNOISE ${CMAKE_DL_LIBS} m)

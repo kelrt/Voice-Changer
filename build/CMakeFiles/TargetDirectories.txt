@@ -1,3 +1,0 @@
-/home/relz/dev/Voice-Changer/build/CMakeFiles/voice_changer_app.dir
-/home/relz/dev/Voice-Changer/build/CMakeFiles/edit_cache.dir
-/home/relz/dev/Voice-Changer/build/CMakeFiles/rebuild_cache.dir
