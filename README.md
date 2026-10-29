@@ -38,8 +38,8 @@ The client waits until the server is up before prompting for input. Once the ser
 
 ## Third-party code
 
-- [miniaudio](https://github.com/mackron/miniaudio): audio I/O (`third_party/miniaudio.h`)
-- [indicators](https://github.com/p-ranav/indicators): terminal progress bar (`src/indicators/`) (i spent wayyy too much time on this...)
-- [RNNoise](https://github.com/xiph/rnnoise): noise suppression (system library)
-- [Applio](https://github.com/IAHispano/Applio): RVC v2 model definition, MIT (`src/server/vendor/`)
+- [miniaudio](https://github.com/mackron/miniaudio): audio I/O 
+- [indicators](https://github.com/p-ranav/indicators): terminal progress bar(i spent wayyy too much time on this...)
+- [RNNoise](https://github.com/xiph/rnnoise): noise suppression
+- [Applio](https://github.com/IAHispano/Applio): RVC v2 model definition
 - ContentVec ONNX export from [MoeSS-SUBModel](https://huggingface.co/NaruseMioShirakana/MoeSS-SUBModel)
