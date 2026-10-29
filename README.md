@@ -5,8 +5,6 @@ A voice converter that records a clip from your microphone and re-speaks it in a
 - The **C++ client** handles audio I/O, RNNoise denoising, band-limited resampling and sample-count correction.
 - A **Python server** runs the neural networks: ContentVec, torchcrepe and an RVC v2 synthesizer.
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for how it fits together.
-
 ## Setup
 
 **Server** (Python 3.10):
@@ -24,7 +22,7 @@ cmake -S . -B build && cmake --build build
 ./build/voice_changer_app
 ```
 
-The client waits until the server is up. Then enter the number of seconds to record:
+The client waits until the server is up before prompting for input. Once the server is connected, the following options are available:
 
 | Input | Action |
 |---|---|
@@ -41,7 +39,7 @@ The client waits until the server is up. Then enter the number of seconds to rec
 ## Third-party code
 
 - [miniaudio](https://github.com/mackron/miniaudio): audio I/O (`third_party/miniaudio.h`)
-- [indicators](https://github.com/p-ranav/indicators): terminal progress bar (`src/indicators/`)
+- [indicators](https://github.com/p-ranav/indicators): terminal progress bar (`src/indicators/`) (i spent wayyy too much time on this...)
 - [RNNoise](https://github.com/xiph/rnnoise): noise suppression (system library)
 - [Applio](https://github.com/IAHispano/Applio): RVC v2 model definition, MIT (`src/server/vendor/`)
 - ContentVec ONNX export from [MoeSS-SUBModel](https://huggingface.co/NaruseMioShirakana/MoeSS-SUBModel)
